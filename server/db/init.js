@@ -725,7 +725,33 @@ function migrateDepartmentsFromText() {
   }
 }
 
-function seedIfEmpty() {
+// Seeds exactly one account — Super Admin — and nothing else (no other users,
+// categories, departments or items). Used by db/reset.js for a true blank
+// slate: the superadmin then creates every department, category, subcategory,
+// item and other user from the app itself.
+function seedSuperadminOnly() {
+  const defaultPassword = "Passw0rd!";
+  const hash = bcrypt.hashSync(defaultPassword, 10);
+  const info = db
+    .prepare(
+      `INSERT INTO users(name, email, password_hash, role, department, is_active, created_at)
+       VALUES (?,?,?,?,?,1,?)`
+    )
+    .run("System Super Admin", "superadmin@plasu.edu.ng", hash, "superadmin", "", nowIso());
+  db.prepare(`INSERT INTO user_roles(user_id, role, created_at) VALUES (?,?,?)`).run(
+    info.lastInsertRowid,
+    "superadmin",
+    nowIso()
+  );
+  console.log(`Seeded 1 Super Admin account (superadmin@plasu.edu.ng). Password: ${defaultPassword}`);
+}
+
+// Full demo dataset (8 role accounts, default categories/departments, 4 sample
+// items) — used ONLY when explicitly asked for (`node db/reset.js --demo`).
+// Never runs automatically on boot: a fresh or deliberately-cleared database
+// should stay exactly as empty as the operator left it, not have a demo
+// account resurrected on every restart.
+function seedDemoData() {
   const userCount = db.prepare("SELECT COUNT(*) AS c FROM users").get().c;
   if (userCount === 0) {
     const defaultPassword = "Passw0rd!";
@@ -743,27 +769,6 @@ function seedIfEmpty() {
     insert.run("Audit Officer", "audit@plasu.edu.ng", hash, "audit_officer", "Internal Audit Unit", nowIso());
     insert.run("Asset & Insurance Officer", "asset@plasu.edu.ng", hash, "asset_officer", "Asset Management Unit", nowIso());
     console.log(`Seeded 8 default users. Default password for all: ${defaultPassword}`);
-  }
-
-  // Backfill accounts for installs seeded before a role existed.
-  const defaultPassword = "Passw0rd!";
-  const newAccounts = [
-    ["Head of Store", "headofstore@plasu.edu.ng", "head_of_store", "Central Store"],
-    ["Issuance Officer", "issuance@plasu.edu.ng", "issuance_officer", "Central Store"],
-    ["Technical Expert", "technical@plasu.edu.ng", "technical_expert", "Works/Technical Unit"],
-    ["Audit Officer", "audit@plasu.edu.ng", "audit_officer", "Internal Audit Unit"],
-    ["Asset & Insurance Officer", "asset@plasu.edu.ng", "asset_officer", "Asset Management Unit"],
-  ];
-  for (const [name, email, role, department] of newAccounts) {
-    const exists = db.prepare("SELECT id FROM users WHERE email = ?").get(email);
-    if (!exists) {
-      const hash = bcrypt.hashSync(defaultPassword, 10);
-      db.prepare(
-        `INSERT INTO users(name, email, password_hash, role, department, is_active, created_at)
-         VALUES (?,?,?,?,?,1,?)`
-      ).run(name, email, hash, role, department, nowIso());
-      console.log(`Added missing default account: ${email} (password: ${defaultPassword})`);
-    }
   }
 
   // Seed default item categories.
@@ -829,33 +834,50 @@ function seedIfEmpty() {
 
       console.log("Seeded 4 sample inventory items with packaging tiers.");
     }
-  } else {
-    const genCat = db.prepare("SELECT id FROM categories WHERE code='GEN'").get();
-    const itemsMissingCat = db.prepare("SELECT id FROM items WHERE category_id IS NULL").all();
-    for (const it of itemsMissingCat) {
-      db.prepare("UPDATE items SET category_id = ? WHERE id = ?").run(genCat ? genCat.id : null, it.id);
-    }
-    const itemsMissingPkg = db
-      .prepare(
-        `SELECT i.id, i.unit FROM items i
-         WHERE NOT EXISTS (SELECT 1 FROM item_packagings p WHERE p.item_id = i.id)`
-      )
-      .all();
-    const insertPkg = db.prepare(
-      `INSERT INTO item_packagings(item_id, label, units_per_pack, is_default, is_active, created_at) VALUES (?,?,1,1,1,?)`
-    );
-    for (const it of itemsMissingPkg) {
-      insertPkg.run(it.id, `Single ${it.unit}`, nowIso());
-    }
-    if (itemsMissingPkg.length > 0) {
-      console.log(`Backfilled default "Single" packaging for ${itemsMissingPkg.length} existing item(s).`);
-    }
+  }
+}
+
+// Fresh install (or a deliberately-cleared one, see db/reset.js) gets a single
+// Super Admin account — nothing more. This is the ONLY thing that runs
+// automatically at boot; it never resurrects demo accounts, categories,
+// departments or sample items that an operator removed on purpose.
+function seedIfEmpty() {
+  const userCount = db.prepare("SELECT COUNT(*) AS c FROM users").get().c;
+  if (userCount === 0) {
+    seedSuperadminOnly();
+  }
+}
+
+// Data-integrity backfill for pre-existing items from an older install (not
+// demo content, so this runs on every boot regardless of seed mode): items
+// missing a category, or missing any packaging tier.
+function backfillItemIntegrity() {
+  const genCat = db.prepare("SELECT id FROM categories WHERE code='GEN'").get();
+  const itemsMissingCat = db.prepare("SELECT id FROM items WHERE category_id IS NULL").all();
+  for (const it of itemsMissingCat) {
+    db.prepare("UPDATE items SET category_id = ? WHERE id = ?").run(genCat ? genCat.id : null, it.id);
+  }
+  const itemsMissingPkg = db
+    .prepare(
+      `SELECT i.id, i.unit FROM items i
+       WHERE NOT EXISTS (SELECT 1 FROM item_packagings p WHERE p.item_id = i.id)`
+    )
+    .all();
+  const insertPkg = db.prepare(
+    `INSERT INTO item_packagings(item_id, label, units_per_pack, is_default, is_active, created_at) VALUES (?,?,1,1,1,?)`
+  );
+  for (const it of itemsMissingPkg) {
+    insertPkg.run(it.id, `Single ${it.unit}`, nowIso());
+  }
+  if (itemsMissingPkg.length > 0) {
+    console.log(`Backfilled default "Single" packaging for ${itemsMissingPkg.length} existing item(s).`);
   }
 }
 
 initSchema();
 migrateSchema();
 seedIfEmpty();
+backfillItemIntegrity();
 migrateDepartmentsFromText();
 backfillUserRoles();
 
@@ -882,5 +904,7 @@ module.exports = {
   notifyUser,
   checkLowStockAndNotify,
   seedIfEmpty,
+  seedSuperadminOnly,
+  seedDemoData,
   backfillUserRoles,
 };
